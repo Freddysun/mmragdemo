@@ -1,0 +1,358 @@
+"""
+全局配置参数文件
+包含所有项目所需的配置参数，如AWS凭证、区域、模型ID、数据库名称等
+"""
+
+import os
+import boto3
+import random
+import json
+from typing import Dict, List, Optional
+
+#################################################
+# 全局配置参数 - 可根据需要修改这些值
+#################################################
+
+# AWS区域配置 - 如果不设置，将使用默认区域
+AWS_REGION = "us-west-2"  # 例如 "us-west-2"，留空则使用默认区域
+
+# S3配置
+S3_BUCKET_NAME = "678246893425-us-west-2-mmrag"  # 留空则自动生成
+SOURCE_PREFIX = "source/"  # 源文件目录
+PROCESSED_PREFIX = "processed/"  # 处理后文件目录
+IMAGES_PREFIX = "images/"  # 提取的图片目录
+TABLES_PREFIX = "tables/"  # 提取的表格目录
+METADATA_PREFIX = "metadata/"  # 元数据目录
+
+# OpenSearch Serverless配置
+OPENSEARCH_COLLECTION_ENDPOINT = "l584eahlr1h19jf0zlya.us-west-2.aoss.amazonaws.com"  # 不要包含https://前缀
+OPENSEARCH_COLLECTION_ID = "l584eahlr1h19jf0zlya"  # 例如 "abcdefghijklmnop"
+OPENSEARCH_INDEX_NAME = "multimodal_index"  # 默认索引名称
+
+# Bedrock知识库配置
+BEDROCK_KB_ID = ""  # 知识库ID
+BEDROCK_DS_ID = ""  # 数据源ID
+
+# 文档处理配置
+CHUNK_SIZE = 512  # 文本分块大小
+CHUNK_OVERLAP = 100  # 文本分块重叠大小
+IMAGE_MIN_WIDTH = 100  # 最小图片宽度
+IMAGE_MIN_HEIGHT = 100  # 最小图片高度
+TABLE_MIN_ROWS = 2  # 最小表格行数
+TABLE_MIN_COLS = 2  # 最小表格列数
+
+# 模型配置
+DEFAULT_LLM_MODEL = "anthropic.claude-3-sonnet-20240229-v1:0"  # 默认LLM模型
+DEFAULT_EMBEDDING_MODEL = "cohere.embed-multilingual-v3"  # 默认嵌入模型
+DEFAULT_MULTIMODAL_EMBEDDING_MODEL = "amazon.titan-embed-image-v1"  # 默认多模态嵌入模型
+DEFAULT_IMAGE_EMBEDDING_MODEL = "amazon.titan-embed-image-v1"  # 默认图像嵌入模型
+
+# RAG配置
+DEFAULT_DOC_NUM = 5  # 默认检索文档数量
+MAX_DOC_NUM = 8  # 最大检索文档数量
+RELEVANCE_THRESHOLD = 0.6  # 相关性阈值，用于过滤rerank后的结果
+
+# 本地目录配置
+DATA_PATH = "./data/"  # 数据目录
+TEMP_PATH = "./temp/"  # 临时目录
+
+#################################################
+# 以下代码用于初始化和管理配置，通常不需要修改
+#################################################
+
+# 生成随机后缀，用于资源命名
+suffix = random.randrange(200, 900)
+
+# 初始化AWS会话和身份信息
+boto3_session = boto3.session.Session(region_name=AWS_REGION if AWS_REGION else None)
+region_name = boto3_session.region_name or "us-west-2"  # 默认使用us-west-2区域
+iam_client = boto3_session.client('iam')
+sts_client = boto3.client('sts')
+account_number = sts_client.get_caller_identity().get('Account')
+identity = sts_client.get_caller_identity()['Arn']
+
+# 初始化AWS服务客户端
+bedrock_client = boto3.client("bedrock-runtime", region_name=region_name)
+s3_client = boto3.client('s3')
+
+# 如果未指定S3存储桶名称，则自动生成
+if not S3_BUCKET_NAME:
+    s3_suffix = f"{account_number}-{region_name}"
+    bucket_name = f'{s3_suffix}-mmrag'
+else:
+    bucket_name = S3_BUCKET_NAME
+
+# 确保本地目录存在
+os.makedirs(DATA_PATH, exist_ok=True)
+os.makedirs(TEMP_PATH, exist_ok=True)
+
+# 配置文件路径
+config_filename = '.mmrag_config.txt'
+
+# IAM策略和角色名称
+encryption_policy_name = f"bedrock-mmrag-sp-{suffix}"
+network_policy_name = f"bedrock-mmrag-np-{suffix}"
+access_policy_name = f'bedrock-mmrag-ap-{suffix}'
+
+# Bedrock模型ID
+class BedrockModels:
+    # 文本嵌入模型
+    TEXT_EMBEDDING = DEFAULT_EMBEDDING_MODEL
+    TEXT_EMBEDDING_V1 = "amazon.titan-embed-text-v1"
+    
+    # 图像嵌入模型
+    IMAGE_EMBEDDING = DEFAULT_IMAGE_EMBEDDING_MODEL
+    
+    # 多模态嵌入模型
+    MULTIMODAL_EMBEDDING = "amazon.titan-embed-image-v1"
+    
+    # LLM模型
+    CLAUDE_HAIKU = "anthropic.claude-3-haiku-20240307-v1:0"
+    CLAUDE_SONNET = "anthropic.claude-3-sonnet-20240229-v1:0"
+    CLAUDE_OPUS = "anthropic.claude-3-opus-20240229-v1:0"
+    
+    # 默认LLM模型
+    DEFAULT_LLM = DEFAULT_LLM_MODEL
+    
+    # Rerank模型
+    RERANK = "cohere.rerank-v3-5:0"
+    
+    # 回答生成模型
+    ANSWER = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+    
+    # 图像生成模型
+
+# 文档处理配置
+class DocumentProcessingConfig:
+    # 文本分割参数
+    CHUNK_SIZE = CHUNK_SIZE
+    CHUNK_OVERLAP = CHUNK_OVERLAP
+    
+    # 图片处理参数
+    IMAGE_MIN_WIDTH = IMAGE_MIN_WIDTH
+    IMAGE_MIN_HEIGHT = IMAGE_MIN_HEIGHT
+    
+    # 表格处理参数
+    TABLE_MIN_ROWS = TABLE_MIN_ROWS
+    TABLE_MIN_COLS = TABLE_MIN_COLS
+    
+    # 文件类型
+    SUPPORTED_DOCUMENT_TYPES = ['.txt', '.csv', '.pdf']
+    SUPPORTED_IMAGE_TYPES = ['.jpg', '.jpeg', '.png']
+
+# RAG配置
+class RAGConfig:
+    # 检索参数
+    DEFAULT_DOC_NUM = DEFAULT_DOC_NUM
+    MAX_DOC_NUM = MAX_DOC_NUM
+    RELEVANCE_THRESHOLD = RELEVANCE_THRESHOLD  # 相关性阈值
+    
+    # 向量搜索配置
+    VECTOR_SEARCH_CONFIG = {"numberOfResults": MAX_DOC_NUM}
+
+# 模型参数默认值
+class ModelDefaults:
+    MAX_TOKENS = 1024
+    TEMPERATURE = 0.1
+    TOP_P = 0.85
+    TOP_K = 40
+    STOP_SEQUENCES = ["\n\nHuman"]
+
+# OpenSearch配置
+class OpenSearchConfig:
+    def __init__(self):
+        # 首先使用全局变量中的值
+        self.collection_endpoint = OPENSEARCH_COLLECTION_ENDPOINT
+        self.collection_id = OPENSEARCH_COLLECTION_ID
+        self.index = OPENSEARCH_INDEX_NAME
+        self.region = region_name
+        self.service = 'aoss'  # Amazon OpenSearch Serverless
+        
+        # 确保endpoint不包含https://前缀
+        if self.collection_endpoint and self.collection_endpoint.startswith("https://"):
+            self.collection_endpoint = self.collection_endpoint.replace("https://", "")
+        
+        # 尝试从配置文件读取，如果存在则覆盖全局变量的值
+        try:
+            with open(config_filename, 'r') as f:
+                config_lines = f.readlines()
+                config_dict = {}
+                for line in config_lines:
+                    if ':' in line:
+                        key, value = line.strip().split(':', 1)
+                        config_dict[key.strip()] = value.strip()
+                
+                # 如果配置文件中有值，则覆盖默认值
+                if 'AOSS_collection_endpoint' in config_dict and config_dict['AOSS_collection_endpoint']:
+                    self.collection_endpoint = config_dict['AOSS_collection_endpoint']
+                    # 确保endpoint不包含https://前缀
+                    if self.collection_endpoint.startswith("https://"):
+                        self.collection_endpoint = self.collection_endpoint.replace("https://", "")
+                if 'AOSS_collection_id' in config_dict and config_dict['AOSS_collection_id']:
+                    self.collection_id = config_dict['AOSS_collection_id']
+                if 'AOSS_index_name' in config_dict and config_dict['AOSS_index_name']:
+                    self.index = config_dict['AOSS_index_name']
+                if 'Region' in config_dict and config_dict['Region']:
+                    self.region = config_dict['Region']
+        except FileNotFoundError:
+            # 如果配置文件不存在，则使用全局变量的值
+            pass
+            
+        # 保存配置到文件
+        self.save_config()
+    
+    def save_config(self):
+        """保存配置到文件"""
+        with open(config_filename, 'w') as f:
+            f.write(f"AOSS_collection_endpoint:{self.collection_endpoint}\n")
+            f.write(f"AOSS_collection_id:{self.collection_id}\n")
+            f.write(f"AOSS_index_name:{self.index}\n")
+            f.write(f"Region:{self.region}\n")
+
+# 知识库配置
+class KnowledgeBaseConfig:
+    def __init__(self):
+        # 首先使用全局变量中的值
+        self.kb_id = BEDROCK_KB_ID
+        self.ds_id = BEDROCK_DS_ID
+        self.region = region_name
+        self.bucket_name = bucket_name
+        
+        # 尝试从配置文件读取，如果存在则覆盖全局变量的值
+        try:
+            with open(config_filename, 'r') as f:
+                config_lines = f.readlines()
+                config_dict = {}
+                for line in config_lines:
+                    if ':' in line:
+                        key, value = line.strip().split(':', 1)
+                        config_dict[key.strip()] = value.strip()
+                
+                # 如果配置文件中有值，则覆盖默认值
+                if 'KB_id' in config_dict and config_dict['KB_id']:
+                    self.kb_id = config_dict['KB_id']
+                if 'DS_id' in config_dict and config_dict['DS_id']:
+                    self.ds_id = config_dict['DS_id']
+                if 'Region' in config_dict and config_dict['Region']:
+                    self.region = config_dict['Region']
+                if 'S3_bucket_name' in config_dict and config_dict['S3_bucket_name']:
+                    self.bucket_name = config_dict['S3_bucket_name']
+        except FileNotFoundError:
+            # 如果配置文件不存在，则使用全局变量的值
+            pass
+            
+        # 保存配置到文件
+        self.save_config()
+    
+    def save_config(self):
+        """保存配置到文件"""
+        with open(config_filename, 'a') as f:
+            f.write(f"KB_id:{self.kb_id}\n")
+            f.write(f"DS_id:{self.ds_id}\n")
+            f.write(f"S3_bucket_name:{self.bucket_name}\n")
+
+# 提示模板
+class PromptTemplates:
+    # 图片描述提示
+    IMAGE_DESCRIPTION = """请详细描述这张图片的内容。
+                        包括图片中的主要对象、场景、文字内容（如果有）、图表信息（如果有）等。
+                        请尽可能详细地描述，以便于理解图片内容。
+                        如果图片中包含表格或图表，请特别说明其结构和内容。"""
+    
+    # 表格描述提示
+    TABLE_DESCRIPTION = """请详细描述这个表格的内容。
+                        包括表格的标题（如果有）、列名、行数、主要数据内容和表格的主要目的。
+                        请尽可能详细地描述，以便于理解表格内容和其在文档中的作用。"""
+    
+    # RAG系统提示
+    RAG_SYSTEM = """您是一个有帮助的助手，提供全面且真实的答案，
+                    利用上下文中提供的所有相关信息。
+                    您通过分析情况并提供见解来增加价值。
+                    如果您找不到任何证据来匹配问题，请直接说您不知道。
+                    """
+
+# 初始化配置
+opensearch_config = OpenSearchConfig()
+kb_config = KnowledgeBaseConfig()
+
+# 导出全局配置实例
+def get_config() -> Dict:
+    """返回当前配置的字典表示"""
+    return {
+        "region_name": region_name,
+        "account_number": account_number,
+        "bucket_name": bucket_name,
+        "source_prefix": SOURCE_PREFIX,
+        "processed_prefix": PROCESSED_PREFIX,
+        "images_prefix": IMAGES_PREFIX,
+        "tables_prefix": TABLES_PREFIX,
+        "metadata_prefix": METADATA_PREFIX,
+        "data_path": DATA_PATH,
+        "temp_path": TEMP_PATH,
+        "kb_config": {
+            "kb_id": kb_config.kb_id,
+            "ds_id": kb_config.ds_id,
+            "region": kb_config.region,
+            "bucket_name": kb_config.bucket_name
+        },
+        "opensearch_config": {
+            "collection_endpoint": opensearch_config.collection_endpoint,
+            "collection_id": opensearch_config.collection_id,
+            "index": opensearch_config.index,
+            "region": opensearch_config.region
+        },
+        "document_processing": {
+            "chunk_size": CHUNK_SIZE,
+            "chunk_overlap": CHUNK_OVERLAP,
+            "image_min_width": IMAGE_MIN_WIDTH,
+            "image_min_height": IMAGE_MIN_HEIGHT,
+            "table_min_rows": TABLE_MIN_ROWS,
+            "table_min_cols": TABLE_MIN_COLS
+        },
+        "models": {
+            "default_llm": DEFAULT_LLM_MODEL,
+            "default_embedding": DEFAULT_EMBEDDING_MODEL,
+            "default_multimodal_embedding": DEFAULT_MULTIMODAL_EMBEDDING_MODEL
+        }
+    }
+
+def update_config(key: str, value: str) -> None:
+    """更新配置文件中的特定键值"""
+    try:
+        with open(config_filename, 'r') as f:
+            lines = f.readlines()
+        
+        updated = False
+        for i, line in enumerate(lines):
+            if line.startswith(f"{key}:"):
+                lines[i] = f"{key}:{value}\n"
+                updated = True
+                break
+        
+        if not updated:
+            lines.append(f"{key}:{value}\n")
+        
+        with open(config_filename, 'w') as f:
+            f.writelines(lines)
+            
+        # 更新配置对象
+        if hasattr(kb_config, key.lower()):
+            setattr(kb_config, key.lower(), value)
+        elif hasattr(opensearch_config, key.lower()):
+            if key == "AOSS_collection_endpoint":
+                setattr(opensearch_config, "collection_endpoint", value)
+            elif key == "AOSS_collection_id":
+                setattr(opensearch_config, "collection_id", value)
+            elif key == "AOSS_index_name":
+                setattr(opensearch_config, "index", value)
+            else:
+                setattr(opensearch_config, key.lower(), value)
+            
+    except Exception as e:
+        print(f"更新配置失败: {str(e)}")
+
+# 打印当前配置
+def print_config():
+    """打印当前配置"""
+    config = get_config()
+    print(json.dumps(config, indent=2))

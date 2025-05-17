@@ -1,0 +1,927 @@
+#!/usr/bin/env python3
+"""
+实现同时搜索文本和图片的组合搜索功能
+支持三种查询模式：
+1. 仅文本查询：使用文本embedding和多模态embedding
+2. 文本+图片查询：使用文本embedding和多模态embedding
+3. 仅图片查询：使用多模态embedding
+"""
+
+import os
+import sys
+import json
+import boto3
+import base64
+from io import BytesIO
+from PIL import Image
+from typing import Dict, List, Any, Optional, Tuple, Union
+
+# 添加mmRAG目录到Python路径
+sys.path.append('/home/ec2-user/mmRAG')
+
+from config import bucket_name, region_name, BedrockModels
+from opensearch_utils import OpenSearchManager
+
+# 初始化客户端
+bedrock_client = boto3.client('bedrock-runtime', region_name=region_name)
+s3_client = boto3.client('s3')
+opensearch_manager = OpenSearchManager()
+
+
+def search_by_text(query: str, k: int = 5, doc_type: Optional[str] = None, 
+                filter_condition: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """
+    使用文本查询搜索内容（关键词匹配）
+
+    Args:
+        query: 查询文本
+        k: 返回结果数量
+        doc_type: 文档类型，可以是'text'或'image'，如果为None则搜索所有类型
+        filter_condition: 额外的过滤条件，用于权限控制等
+
+    Returns:
+        搜索结果列表
+    """
+    # 构建查询
+    must_conditions = [
+        {
+            "match": {
+                "content": query
+            }
+        }
+    ]
+
+    # 根据doc_type添加过滤条件
+    if doc_type == 'pdf':
+        must_not_conditions = [
+            {
+                "term": {
+                    "document_type": "image"
+                }
+            }
+        ]
+        search_body = {
+            "size": k,
+            "query": {
+                "bool": {
+                    "must": must_conditions,
+                    "must_not": must_not_conditions
+                }
+            }
+        }
+    elif doc_type == 'image':
+        must_conditions.append({
+            "term": {
+                "document_type": "image"
+            }
+        })
+        search_body = {
+            "size": k,
+            "query": {
+                "bool": {
+                    "must": must_conditions
+                }
+            }
+        }
+    else:
+        search_body = {
+            "size": k,
+            "query": {
+                "bool": {
+                    "must": must_conditions
+                }
+            }
+        }
+    
+    # 如果有额外的过滤条件，添加到查询中
+    if filter_condition:
+        if 'filter' not in search_body['query']['bool']:
+            search_body['query']['bool']['filter'] = []
+        
+        if isinstance(filter_condition, list):
+            search_body['query']['bool']['filter'].extend(filter_condition)
+        else:
+            search_body['query']['bool']['filter'].append(filter_condition)
+
+    try:
+        # 执行搜索
+        index_name = 'multimodal_index'
+        print(f"使用索引: {index_name}")
+        response = opensearch_manager.opensearch_client.search(
+            index=index_name,
+            body=search_body
+        )
+
+        # 处理结果
+        results = []
+        for hit in response['hits']['hits']:
+            is_image = hit['_source'].get('document_type') == 'image'
+            result = {
+                'score': hit['_score'],
+                'content': hit['_source'].get('content', ''),
+                'document_id': hit['_source'].get('document_id', ''),
+                'source': hit['_source'].get('source', ''),
+                'metadata': hit['_source'].get('metadata', {}),
+                'type': 'image' if is_image else 'text',
+                'search_method': 'text_match'  # 添加搜索方法标记
+            }
+            results.append(result)
+
+        return results
+
+    except Exception as e:
+        print(f"文本搜索时出错: {str(e)}")
+        return []
+
+
+
+def get_text_embedding(text: str, model_id: str = BedrockModels.TEXT_EMBEDDING) -> List[float]:
+    """
+    使用Bedrock获取文本的embedding向量
+    
+    Args:
+        text: 要进行embedding的文本
+        model_id: 使用的embedding模型ID
+        
+    Returns:
+        embedding向量
+    """
+    try:
+        # 准备请求体
+        request_body = {
+            "texts": [text],
+            "input_type": "search_query"  # 对于查询使用search_query类型
+        }
+        
+        # 调用Bedrock API
+        response = bedrock_client.invoke_model(
+            modelId=model_id,
+            contentType="application/json",
+            accept="*/*",
+            body=json.dumps(request_body)
+        )
+        
+        # 解析响应
+        response_body = json.loads(response['body'].read())
+        embedding = response_body['embeddings'][0]
+        
+        return embedding
+    
+    except Exception as e:
+        print(f"获取文本embedding时出错: {str(e)}")
+        return []
+
+def get_multimodal_embedding(text: Optional[str] = None, image_data: Optional[bytes] = None, 
+                            model_id: str = BedrockModels.MULTIMODAL_EMBEDDING) -> List[float]:
+    """
+    使用Bedrock获取多模态embedding向量
+    
+    Args:
+        text: 文本内容（可选）
+        image_data: 图片数据（可选）
+        model_id: 使用的多模态embedding模型ID
+        
+    Returns:
+        多模态embedding向量
+    """
+    try:
+        # 至少需要提供文本或图片之一
+        if text is None and image_data is None:
+            print("错误: 文本和图片不能同时为空")
+            return []
+        
+        # 准备请求体
+        request_body = {}
+        
+        # 添加文本（如果有）
+        if text is not None:
+            request_body["inputText"] = text
+        else:
+            request_body["inputText"] = ""  # 提供空文本
+        
+        # 添加图片（如果有）
+        if image_data is not None:
+            # 将图片转换为base64编码
+            base64_image = base64.b64encode(image_data).decode('utf-8')
+            request_body["inputImage"] = base64_image
+        
+        # 调用Bedrock API
+        response = bedrock_client.invoke_model(
+            modelId=model_id,
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps(request_body)
+        )
+        
+        # 解析响应
+        response_body = json.loads(response['body'].read())
+        embedding = response_body.get('embedding')
+        
+        if not embedding:
+            print("警告: 响应中没有找到embedding字段")
+            return []
+        
+        return embedding
+    
+    except Exception as e:
+        print(f"获取多模态embedding时出错: {str(e)}")
+        return []
+
+def get_image_from_s3(s3_path: str) -> Optional[bytes]:
+    """
+    从S3获取图片数据
+    
+    Args:
+        s3_path: S3中的图片路径
+        
+    Returns:
+        图片数据
+    """
+    try:
+        response = s3_client.get_object(
+            Bucket=bucket_name,
+            Key=s3_path
+        )
+        image_data = response['Body'].read()
+        return image_data
+    except Exception as e:
+        print(f"获取图片时出错: {str(e)}")
+        return None
+
+def search_by_vector(vector: List[float], field_name: str, k: int = 5, 
+                    doc_type: Optional[str] = None, 
+                    filter_condition: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """
+    使用向量搜索内容
+    
+    Args:
+        vector: 查询向量
+        field_name: 要搜索的向量字段名称
+        k: 返回结果数量
+        doc_type: 文档类型，可以是'text'或'image'，如果为None则搜索所有类型
+        filter_condition: 额外的过滤条件，用于权限控制等
+        
+    Returns:
+        搜索结果列表
+    """
+    if not vector:
+        print(f"错误: 向量为空，无法执行搜索")
+        return []
+    
+    # 构建KNN查询
+    knn_query = {
+        "vector": vector,
+        "k": k
+    }
+    
+    # 根据doc_type添加过滤条件
+    doc_type_filter = None
+    if doc_type == 'pdf':
+        doc_type_filter = {
+            "bool": {
+                "must_not": [
+                    {"term": {"document_type": "image"}}
+                ]
+            }
+        }
+    elif doc_type == 'image':
+        doc_type_filter = {
+            "bool": {
+                "must": [
+                    {"term": {"document_type": "image"}}
+                ]
+            }
+        }
+    
+    # 组合所有过滤条件
+    combined_filter = None
+    if doc_type_filter and filter_condition:
+        # 如果同时有文档类型过滤和自定义过滤，合并它们
+        combined_filter = {
+            "bool": {
+                "must": [
+                    doc_type_filter,
+                    filter_condition
+                ]
+            }
+        }
+    elif doc_type_filter:
+        combined_filter = doc_type_filter
+    elif filter_condition:
+        combined_filter = filter_condition
+    
+    # 构建完整查询
+    if combined_filter:
+        search_body = {
+            "size": k,
+            "query": {
+                "bool": {
+                    "must": [
+                        {
+                            "knn": {
+                                field_name: knn_query
+                            }
+                        }
+                    ],
+                    "filter": combined_filter
+                }
+            }
+        }
+    else:
+        search_body = {
+            "size": k,
+            "query": {
+                "knn": {
+                    field_name: knn_query
+                }
+            }
+        }
+    
+    # 执行搜索
+    try:
+        # 获取索引名称
+        index_name = opensearch_manager.opensearch_client.indices.get('*').popitem()[0]
+        
+        # 执行搜索
+        response = opensearch_manager.opensearch_client.search(
+            index=index_name,
+            body=search_body
+        )
+        
+        # 处理结果
+        results = []
+        for hit in response['hits']['hits']:
+            is_image = hit['_source'].get('document_type') == 'image'
+            result = {
+                'score': hit['_score'],
+                'content': hit['_source'].get('content', ''),
+                'document_id': hit['_source'].get('document_id', ''),
+                'source': hit['_source'].get('source', ''),
+                'metadata': hit['_source'].get('metadata', {}),
+                'type': 'image' if is_image else 'text',
+                'search_method': f"vector_search_{field_name}"  # 添加搜索方法标记
+            }
+            results.append(result)
+        
+        return results
+    
+    except Exception as e:
+        print(f"向量搜索时出错: {str(e)}")
+        return []
+
+
+def text_only_search(query: str, text_k: int = 5, image_k: int = 3, 
+                  filter_condition: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """
+    仅文本查询策略
+    
+    Args:
+        query: 查询文本
+        text_k: 返回的文本结果数量
+        image_k: 返回的图片结果数量
+        filter_condition: 额外的过滤条件，用于权限控制等
+        
+    Returns:
+        搜索结果列表
+    """
+    results = []
+    
+    # 1. 使用文本embedding在text_embedding字段搜索
+    text_embedding = get_text_embedding(query)
+    if text_embedding:
+        text_results = search_by_vector(
+            vector=text_embedding,
+            field_name="text_embedding",
+            k=text_k,
+            doc_type='pdf',
+            filter_condition=filter_condition
+        )
+        results.extend(text_results)
+        
+        # 也搜索图片描述
+        image_results_text = search_by_vector(
+            vector=text_embedding,
+            field_name="text_embedding",
+            k=image_k,
+            doc_type='image',
+            filter_condition=filter_condition
+        )
+        results.extend(image_results_text)
+    
+    # 2. 使用多模态embedding在multimodal_embedding字段搜索
+    multimodal_embedding = get_multimodal_embedding(text=query)
+    if multimodal_embedding:
+        # 搜索文本
+        mm_text_results = search_by_vector(
+            vector=multimodal_embedding,
+            field_name="multimodal_embedding",
+            k=text_k,
+            doc_type='pdf',
+            filter_condition=filter_condition
+        )
+        results.extend(mm_text_results)
+        
+        # 搜索图片
+        mm_image_results = search_by_vector(
+            vector=multimodal_embedding,
+            field_name="multimodal_embedding",
+            k=image_k,
+            doc_type='image',
+            filter_condition=filter_condition
+        )
+        results.extend(mm_image_results)
+    
+    # 3. 如果向量搜索失败，回退到文本匹配
+    if not results:
+        text_results = search_by_text(query, k=text_k, doc_type='pdf', filter_condition=filter_condition)
+        for result in text_results:
+            result['search_method'] = 'text_match'
+            
+        image_results = search_by_text(query, k=image_k, doc_type='image', filter_condition=filter_condition)
+        # 为结果添加搜索方法标记
+        for result in image_results:
+            result['search_method'] = 'text_match'
+            
+        results.extend(text_results)
+        results.extend(image_results)
+    
+    return results
+
+def text_and_image_search(query: str, image_data: bytes, text_k: int = 5, image_k: int = 3,
+                         filter_condition: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """
+    文本+图片查询策略
+    
+    Args:
+        query: 查询文本
+        image_data: 图片数据
+        text_k: 返回的文本结果数量
+        image_k: 返回的图片结果数量
+        filter_condition: 额外的过滤条件，用于权限控制等
+        
+    Returns:
+        搜索结果列表
+    """
+    results = []
+    
+    # 1. 使用文本embedding在text_embedding字段搜索
+    text_embedding = get_text_embedding(query)
+    if text_embedding:
+        text_results = search_by_vector(
+            vector=text_embedding,
+            field_name="text_embedding",
+            k=text_k,
+            doc_type='pdf',
+            filter_condition=filter_condition
+        )
+        results.extend(text_results)
+    
+    # 2. 使用多模态embedding在multimodal_embedding字段搜索
+    multimodal_embedding = get_multimodal_embedding(text=query, image_data=image_data)
+    if multimodal_embedding:
+        # 搜索文本
+        mm_text_results = search_by_vector(
+            vector=multimodal_embedding,
+            field_name="multimodal_embedding",
+            k=text_k,
+            doc_type='pdf',
+            filter_condition=filter_condition
+        )
+        results.extend(mm_text_results)
+        
+        # 搜索图片
+        mm_image_results = search_by_vector(
+            vector=multimodal_embedding,
+            field_name="multimodal_embedding",
+            k=image_k,
+            doc_type='image',
+            filter_condition=filter_condition
+        )
+        results.extend(mm_image_results)
+    
+    # 3. 如果向量搜索失败，回退到文本匹配
+    if not results:
+        text_results = search_by_text(query, k=text_k, doc_type='pdf', filter_condition=filter_condition)
+        for result in text_results:
+            result['search_method'] = 'text_match'
+            
+        image_results = search_by_text(query, k=image_k, doc_type='image', filter_condition=filter_condition)
+        for result in image_results:
+            result['search_method'] = 'text_match'
+        
+        results.extend(text_results)
+        results.extend(image_results)
+    
+    return results
+
+def image_only_search(image_data: bytes, k: int = 5, 
+                     filter_condition: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """
+    仅图片查询策略
+    
+    Args:
+        image_data: 图片数据
+        k: 返回结果数量
+        filter_condition: 额外的过滤条件，用于权限控制等
+        
+    Returns:
+        搜索结果列表
+    """
+    results = []
+    
+    # 使用多模态embedding在multimodal_embedding字段搜索
+    multimodal_embedding = get_multimodal_embedding(image_data=image_data)
+    if multimodal_embedding:
+        # 主要搜索图片
+        image_results = search_by_vector(
+            vector=multimodal_embedding,
+            field_name="multimodal_embedding",
+            k=k,
+            doc_type='image',
+            filter_condition=filter_condition
+        )
+        results.extend(image_results)
+        
+        # 也搜索一些相关文本
+        text_results = search_by_vector(
+            vector=multimodal_embedding,
+            field_name="multimodal_embedding",
+            k=k,
+            doc_type='pdf',
+            filter_condition=filter_condition
+        )
+        results.extend(text_results)
+    
+    return results
+
+def rerank_results(query: str, results: List[Dict[str, Any]], top_n: int = 5) -> List[Dict[str, Any]]:
+    """
+    使用Bedrock的rerank模型对结果进行重排序
+    
+    Args:
+        query: 查询文本
+        results: 搜索结果列表
+        top_n: 返回的结果数量
+        
+    Returns:
+        重排序后的结果列表
+    """
+    if not results:
+        return []
+    
+    # 准备文档列表
+    documents = [result['content'] for result in results]
+    
+    # 准备请求体 - 根据Cohere rerank-v3-5模型的要求
+    request_body = {
+        "query": query,
+        "documents": documents,
+        "top_n": min(top_n, len(documents)),
+        "api_version": 2  # 整数类型的api_version，值为2
+    }
+    
+    try:
+        # 调用Bedrock API
+        response = bedrock_client.invoke_model(
+            modelId=BedrockModels.RERANK,
+            body=json.dumps(request_body)
+        )
+        
+        # 解析响应
+        response_body = json.loads(response['body'].read())
+        reranked_results = []
+        
+        # 从config中获取相关性阈值
+        from config import RELEVANCE_THRESHOLD
+        
+        # 重新组织结果，并应用相关性阈值过滤
+        for item in response_body.get('results', []):
+            index = item.get('index')
+            relevance_score = item.get('relevance_score', 0)
+            
+            # 只保留相关性分数高于阈值的结果
+            if relevance_score >= RELEVANCE_THRESHOLD and 0 <= index < len(results):
+                result = results[index].copy()
+                result['score'] = relevance_score
+                result['reranked'] = True  # 标记为已重排序
+                reranked_results.append(result)
+        
+        return reranked_results
+    
+    except Exception as e:
+        print(f"重排序时出错: {str(e)}")
+        return results[:top_n]  # 如果出错，返回原始结果的前top_n个
+
+def multimodal_search(query: Optional[str] = None, image_data: Optional[bytes] = None, 
+                     text_k: int = 5, image_k: int = 3, use_rerank: bool = True,
+                     filter_condition: Optional[Dict[str, Any]] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    多模态搜索入口函数，根据输入类型选择不同的搜索策略
+    
+    Args:
+        query: 查询文本（可选）
+        image_data: 图片数据（可选）
+        text_k: 返回的文本结果数量
+        image_k: 返回的图片结果数量
+        use_rerank: 是否使用rerank
+        filter_condition: 额外的过滤条件，用于权限控制等
+        
+    Returns:
+        文本搜索结果和图片搜索结果的元组
+    """
+    # 确定查询类型
+    if query and image_data:
+        # 文本+图片查询
+        print("执行文本+图片查询")
+        all_results = text_and_image_search(query, image_data, text_k=text_k*2, image_k=image_k*2, filter_condition=filter_condition)
+    elif query:
+        # 仅文本查询
+        print("执行仅文本查询")
+        all_results = text_only_search(query, text_k=text_k*2, image_k=image_k*2, filter_condition=filter_condition)
+    elif image_data:
+        # 仅图片查询
+        print("执行仅图片查询")
+        all_results = image_only_search(image_data, k=(text_k+image_k)*2, filter_condition=filter_condition)
+    else:
+        # 无效查询
+        print("错误: 查询文本和图片不能同时为空")
+        return [], []
+    
+    # 如果启用了rerank，对结果进行重排序
+    if use_rerank and query:  # 只有在有文本查询时才能使用rerank
+        all_results = rerank_results(query, all_results, top_n=(text_k+image_k)*2)
+        
+        # 如果rerank后没有结果（可能是因为所有结果都低于阈值），则打印警告
+        if not all_results:
+            print("警告: rerank后没有结果满足相关性阈值要求，尝试使用原始结果")
+            # 可以选择回退到原始结果或者返回空结果
+            # 这里我们选择返回空结果
+            return [], []
+    
+    # 分离文本和图片结果
+    text_results = [r for r in all_results if r.get('type') != 'image'][:text_k]
+    image_results = [r for r in all_results if r.get('type') == 'image'][:image_k]
+    
+    return text_results, image_results
+
+def combined_search(query: str, text_k: int = 5, image_k: int = 3, use_rerank: bool = True,
+                   filter_condition: Optional[Dict[str, Any]] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    组合搜索，同时搜索文本和图片（兼容旧接口）
+    
+    Args:
+        query: 查询文本
+        text_k: 返回的文本结果数量
+        image_k: 返回的图片结果数量
+        use_rerank: 是否使用rerank
+        filter_condition: 额外的过滤条件，用于权限控制等
+        
+    Returns:
+        文本搜索结果和图片搜索结果的元组
+    """
+    return multimodal_search(query=query, text_k=text_k, image_k=image_k, use_rerank=use_rerank, filter_condition=filter_condition)
+
+def get_image_from_s3(s3_path: str) -> Optional[Tuple[Image.Image, bytes]]:
+    """
+    从S3获取图片
+    
+    Args:
+        s3_path: S3中的图片路径
+        
+    Returns:
+        PIL图片对象和原始图片数据的元组
+    """
+    try:
+        response = s3_client.get_object(
+            Bucket=bucket_name,
+            Key=s3_path
+        )
+        image_data = response['Body'].read()
+        return Image.open(BytesIO(image_data)), image_data
+    except Exception as e:
+        print(f"获取图片时出错: {str(e)}")
+        return None
+
+def generate_answer(query: str, text_results: List[Dict[str, Any]], image_results: List[Dict[str, Any]]) -> Tuple[str, List[str]]:
+    """
+    使用Bedrock的Claude 3.5 Sonnet模型生成回答，包含图片
+    
+    Args:
+        query: 查询文本
+        text_results: 文本搜索结果
+        image_results: 图片搜索结果
+        
+    Returns:
+        生成的回答和引用信息的元组
+    """
+    if not text_results and not image_results:
+        return "抱歉，没有找到相关信息。", []
+    
+    # 准备引用信息
+    references = []
+    
+    # 添加文本引用
+    for i, result in enumerate(text_results[:3]):
+        doc_id = result.get('document_id', f'doc-{i}')
+        source = result.get('source', '未知来源')
+        references.append(f"[{i+1}] {doc_id} - {source}")
+    
+    # 添加图片引用
+    for i, result in enumerate(image_results[:2]):
+        doc_id = result.get('document_id', f'img-{i}')
+        source = result.get('source', '未知来源')
+        image_info = result.get('metadata', {}).get('image_info', {})
+        s3_path = image_info.get('s3_path', '')
+        s3_url = f"s3://{bucket_name}/{s3_path}" if s3_path else '未知路径'
+        references.append(f"[{len(text_results[:3])+i+1}] {doc_id} - {source} - {s3_url}")
+    
+    # 准备上下文文本
+    context = f"用户查询: {query}\n\n"
+    
+    # 添加文本内容
+    if text_results:
+        context += "文本信息:\n"
+        for i, result in enumerate(text_results[:3]):
+            context += f"文本 [{i+1}]: {result['content'][:500]}...\n\n"
+    
+    # 添加图片描述
+    if image_results:
+        context += "图片信息:\n"
+        for i, result in enumerate(image_results[:2]):
+            context += f"图片 [{len(text_results[:3])+i+1}]: {result['content']}\n\n"
+    
+    # 准备提示词
+    prompt = f"""你是一个专业的AWS技术助手。请根据以下信息回答用户的问题。
+    
+用户问题: {query}
+
+参考信息:
+{context}
+
+请提供一个全面、准确的回答，同时引用相关的文本和图片信息。在引用信息时，请使用角标形式，如[1]、[2]等。
+回答应该结构清晰，使用markdown格式。
+
+只需要输出组合回答即可，不要重复引用的原始内容。不要在回答中包含参考资料部分，参考资料会自动添加到回答末尾。
+"""
+    
+    # 准备消息内容
+    message_content = [
+        {
+            "type": "text",
+            "text": prompt
+        }
+    ]
+    
+    # 添加图片到消息内容
+    for i, result in enumerate(image_results[:1]):  # 只添加第一张图片
+        image_info = result.get('metadata', {}).get('image_info', {})
+        s3_path = image_info.get('s3_path', '')
+        
+        if s3_path:
+            # 获取图片并转换为base64
+            image_result = get_image_from_s3(s3_path)
+            if image_result:
+                _, image_data = image_result
+                base64_image = base64.b64encode(image_data).decode('utf-8')
+                
+                # 添加图片到消息内容
+                message_content.insert(0, {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": base64_image
+                    }
+                })
+    
+    # 准备请求体 - 使用Claude 3.5 Sonnet的消息格式
+    request_body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 1000,
+        "messages": [
+            {
+                "role": "user",
+                "content": message_content
+            }
+        ]
+    }
+    
+    try:
+        # 调用Bedrock API
+        response = bedrock_client.invoke_model(
+            modelId=BedrockModels.ANSWER,
+            body=json.dumps(request_body)
+        )
+        
+        # 解析响应
+        response_body = json.loads(response['body'].read())
+        
+        # Claude 3.5 Sonnet返回的格式是消息格式
+        answer = ""
+        if 'content' in response_body and len(response_body['content']) > 0:
+            # 提取文本内容
+            for content_item in response_body['content']:
+                if content_item.get('type') == 'text':
+                    answer = content_item.get('text', "无法生成回答。")
+        
+        if not answer:
+            answer = "无法生成回答。"
+        
+        return answer, references
+    
+    except Exception as e:
+        print(f"生成回答时出错: {str(e)}")
+        return f"生成回答时出错: {str(e)}", []
+
+def format_result(result: Dict[str, Any]) -> str:
+    """
+    格式化搜索结果
+    
+    Args:
+        result: 搜索结果
+        
+    Returns:
+        格式化后的字符串
+    """
+    output = []
+    output.append(f"得分: {result['score']:.2f}")
+    
+    # 添加搜索方法信息
+    if 'search_method' in result:
+        output.append(f"搜索方法: {result['search_method']}")
+    
+    # 添加重排序标记
+    if result.get('reranked'):
+        output.append("已重排序: 是")
+    
+    if result['type'] == 'text':
+        output.append(f"文档: {result['source']}")
+        content = result['content']
+        if len(content) > 300:
+            content = content[:300] + "..."
+        output.append(f"内容: {content}")
+    else:
+        output.append(f"图片ID: {result['document_id']}")
+        output.append(f"来源: {result['source']}")
+        
+        # 获取图片路径
+        image_info = result.get('metadata', {}).get('image_info', {})
+        s3_path = image_info.get('s3_path', '')
+        if s3_path:
+            output.append(f"图片路径: s3://{bucket_name}/{s3_path}")
+        
+        # 打印描述的前200个字符
+        content = result.get('content', '')
+        if content:
+            desc = content[:200] + "..." if len(content) > 200 else content
+            output.append(f"描述: {desc}")
+    
+    return "\n".join(output)
+
+def main():
+    """主函数"""
+    # 测试查询
+    queries = [
+        "VPC对等连接是什么？它有什么用途？",
+        "AWS架构图中如何表示VPC连接？",
+        "如何配置安全组和子网？",
+        "什么是虚拟私有云？"
+    ]
+    
+    for query in queries:
+        print(f"\n\n查询: '{query}'")
+        print("=" * 80)
+        
+        # 使用增强的搜索功能
+        text_results, image_results = multimodal_search(query=query, text_k=3, image_k=2, use_rerank=True)
+        
+        print("\n文本搜索结果:")
+        print("-" * 50)
+        if not text_results:
+            print("没有找到相关文本内容")
+        else:
+            for i, result in enumerate(text_results):
+                print(f"\n文本结果 {i+1}:")
+                print(format_result(result))
+        
+        print("\n图片搜索结果:")
+        print("-" * 50)
+        if not image_results:
+            print("没有找到相关图片")
+        else:
+            for i, result in enumerate(image_results):
+                print(f"\n图片结果 {i+1}:")
+                print(format_result(result))
+        
+        # 使用LLM生成回答
+        print("\n生成的回答:")
+        print("-" * 50)
+        answer, references = generate_answer(query, text_results, image_results)
+        print(answer)
+        
+        print("\n参考资料:")
+        for ref in references:
+            print(ref)
+
+if __name__ == "__main__":
+    main()

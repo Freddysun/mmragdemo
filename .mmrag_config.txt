@@ -1,0 +1,7 @@
+AOSS_collection_endpoint:l584eahlr1h19jf0zlya.us-west-2.aoss.amazonaws.com
+AOSS_collection_id:l584eahlr1h19jf0zlya
+AOSS_index_name:multimodal-index
+Region:us-west-2
+KB_id:
+DS_id:
+S3_bucket_name:678246893425-us-west-2-mmrag
